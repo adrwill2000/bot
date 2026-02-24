@@ -45,9 +45,9 @@ from leaderboard import (
 # ─────────────────────────────────────────────────────────────────────────────
 # CONFIG  (override via environment variables)
 # ─────────────────────────────────────────────────────────────────────────────
-BOT_TOKEN  = os.getenv("BOT_TOKEN",  8763607043:AAF5z26R1bmyqKW-twxhe4kss9ueK5PqL9M)
+BOT_TOKEN  = os.getenv("BOT_TOKEN",  "Bot token ID here")
 ADMIN_IDS  = [
-    int(x) for x in os.getenv("ADMIN_IDS", "@philaccio42069").split(",") if x.strip().isdigit()
+    int(x) for x in os.getenv("ADMIN_IDS", "0").split(",") if x.strip().isdigit()
 ]
 SPIKE_THRESHOLD    = float(os.getenv("SPIKE_THRESHOLD", "50"))  # percent
 MONITOR_INTERVAL   = int(os.getenv("MONITOR_INTERVAL",  "300")) # seconds
