@@ -252,6 +252,152 @@ def dexscreener_get_ohlcv(chain_id: str, pair_address: str,
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# BIRDEYE — OHLCV fallback (covers pump.fun + new Solana tokens)
+# Free public endpoint, no API key required for basic OHLCV.
+# ─────────────────────────────────────────────────────────────────────────────
+
+BIRDEYE_OHLCV_URL = "https://public-api.birdeye.so/defi/ohlcv"
+
+_BIRDEYE_INTERVAL = {
+    "1m":  "1m",
+    "5m":  "5m",
+    "15m": "15m",
+    "1h":  "1H",
+    "4h":  "4H",
+    "1d":  "1D",
+}
+
+def birdeye_get_ohlcv(mint: str, interval: str = "4h",
+                       limit: int = 100) -> Optional[List[Dict]]:
+    """
+    Fetch OHLCV from Birdeye public API.
+    Works for pump.fun tokens and any SPL token with trading activity.
+    No API key needed for this endpoint.
+    """
+    birdeye_interval = _BIRDEYE_INTERVAL.get(interval, "4H")
+    now_ts   = int(time.time())
+    # Calculate interval in seconds for lookback
+    interval_secs = {
+        "1m": 60, "5m": 300, "15m": 900,
+        "1h": 3600, "4h": 14400, "1d": 86400,
+    }.get(interval, 14400)
+    from_ts = now_ts - (interval_secs * limit)
+
+    data = _get(
+        BIRDEYE_OHLCV_URL,
+        params={
+            "address":        mint,
+            "type":           birdeye_interval,
+            "time_from":      from_ts,
+            "time_to":        now_ts,
+            "currency":       "usd",
+        },
+        timeout=12,
+    )
+    if not data:
+        return None
+
+    # Birdeye returns {"data": {"items": [...]}}
+    items = None
+    try:
+        items = data.get("data", {}).get("items") or data.get("items") or []
+    except Exception:
+        return None
+
+    if not items:
+        return None
+
+    result = []
+    for c in items:
+        try:
+            result.append({
+                "time":   int(c.get("unixTime", 0)) * 1000,  # → ms
+                "open":   float(c.get("o") or c.get("open",  0)),
+                "high":   float(c.get("h") or c.get("high",  0)),
+                "low":    float(c.get("l") or c.get("low",   0)),
+                "close":  float(c.get("c") or c.get("close", 0)),
+                "volume": float(c.get("v") or c.get("volume", 0)),
+            })
+        except Exception:
+            continue
+
+    return result if len(result) >= 3 else None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SYNTHETIC CANDLES — built from DexScreener recent trades
+# Last-resort fallback when no OHLCV endpoint has data (brand-new tokens).
+# ─────────────────────────────────────────────────────────────────────────────
+
+def dexscreener_build_synthetic_candles(pair_address: str, chain_id: str = "solana",
+                                         interval: str = "4h") -> Optional[List[Dict]]:
+    """
+    Fetch recent trade data from DexScreener and aggregate into OHLCV candles.
+    Used when no dedicated candle endpoint returns data (e.g. pump.fun tokens
+    that are hours old).  Returns at least 3 candles or None.
+    """
+    # DexScreener trades endpoint
+    data = _get(
+        f"https://api.dexscreener.com/latest/dex/trades/{pair_address}",
+        timeout=12,
+    )
+    if not data:
+        return None
+
+    trades = data if isinstance(data, list) else data.get("trades") or []
+    if not trades:
+        return None
+
+    # interval_secs bucketing
+    interval_secs = {
+        "1m": 60, "5m": 300, "15m": 900,
+        "1h": 3600, "4h": 14400, "1d": 86400,
+    }.get(interval, 14400)
+
+    # Build buckets: {bucket_start_ts: [prices]}
+    buckets: Dict[int, list] = {}
+    for t in trades:
+        try:
+            ts_s  = int(t.get("timestamp", 0) or 0)
+            price = float(t.get("priceUsd") or 0)
+            vol   = float(t.get("volumeUsd") or 0)
+            if ts_s <= 0 or price <= 0:
+                continue
+            bucket = (ts_s // interval_secs) * interval_secs
+            if bucket not in buckets:
+                buckets[bucket] = []
+            buckets[bucket].append((ts_s, price, vol))
+        except Exception:
+            continue
+
+    if len(buckets) < 3:
+        # Too few buckets — try smaller interval (1h) if we were asked for 4h
+        if interval == "4h" and len(buckets) < 3:
+            return dexscreener_build_synthetic_candles(pair_address, chain_id, "1h")
+        if interval == "1h" and len(buckets) < 3:
+            return dexscreener_build_synthetic_candles(pair_address, chain_id, "15m")
+        return None
+
+    result = []
+    for bucket_ts in sorted(buckets.keys()):
+        trades_in = buckets[bucket_ts]
+        prices = [p for _, p, _ in trades_in]
+        vols   = [v for _, _, v in trades_in]
+        # Sort by timestamp to get true open/close
+        ordered = sorted(trades_in, key=lambda x: x[0])
+        result.append({
+            "time":   bucket_ts * 1000,
+            "open":   ordered[0][1],
+            "close":  ordered[-1][1],
+            "high":   max(prices),
+            "low":    min(prices),
+            "volume": sum(vols),
+        })
+
+    return result if len(result) >= 3 else None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # BINANCE — Fallback for major tickers
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -513,6 +659,7 @@ def generate_chart(
         candles = None
 
         if token.chain == "solana" and token.pair_address:
+            # 1st try: DexScreener candle endpoint
             candles = dexscreener_get_ohlcv(
                 token.pair_chain_id or "solana",
                 token.pair_address,
@@ -520,10 +667,24 @@ def generate_chart(
                 limit=100,
             )
 
+            # 2nd try: Birdeye (covers pump.fun and new tokens DexScreener lacks candles for)
+            if candles is None and token.mint:
+                logger.debug(f"DexScreener candles empty for {token.mint}, trying Birdeye…")
+                candles = birdeye_get_ohlcv(token.mint, interval=interval, limit=100)
+
+            # 3rd try: Synthetic candles built from DexScreener trade history
+            if candles is None:
+                logger.debug(f"Birdeye empty for {token.mint}, building synthetic candles…")
+                candles = dexscreener_build_synthetic_candles(
+                    token.pair_address,
+                    chain_id=token.pair_chain_id or "solana",
+                    interval=interval,
+                )
+
         if candles is None and token.chain != "solana":
             candles = binance_get_ohlcv(token.symbol, interval=interval, limit=100)
 
-        if candles is None and token.pair_address:
+        if candles is None and token.pair_address and token.chain != "solana":
             # Last ditch DexScreener attempt for non-Solana pairs
             candles = dexscreener_get_ohlcv(
                 token.pair_chain_id or "solana",
