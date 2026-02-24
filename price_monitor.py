@@ -58,6 +58,7 @@ class PriceMonitor:
                         pnl_pct=pnl_pct,
                         caller_user_id=call["user_id"],
                         call_id=call["id"],
+                        chat_id=call.get("chat_id", 0),
                     )
 
             except Exception as e:

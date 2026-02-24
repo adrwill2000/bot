@@ -7,7 +7,6 @@ Usage:
 
 Environment variables (or edit CONFIG block below):
     BOT_TOKEN   — Your BotFather token
-    CHANNEL_ID  — Channel username (@mychannel) or numeric ID (-100xxxxxxx)
     ADMIN_IDS   — Comma-separated Telegram user IDs with admin rights
 """
 
@@ -29,7 +28,7 @@ from telegram.ext import (
 from telegram.constants import ParseMode
 
 from database import Database
-from chart_generator import generate_chart, get_current_price
+from chart_generator import generate_chart, get_current_price, is_solana_ca, resolve_token
 from pnl_card import generate_pnl_card
 from price_monitor import PriceMonitor
 from roasts import (
@@ -46,10 +45,9 @@ from leaderboard import (
 # ─────────────────────────────────────────────────────────────────────────────
 # CONFIG  (override via environment variables)
 # ─────────────────────────────────────────────────────────────────────────────
-BOT_TOKEN  = os.getenv("BOT_TOKEN",  "YOUR_BOT_TOKEN_HERE")
-CHANNEL_ID = os.getenv("CHANNEL_ID", "@your_channel")   # e.g. @mycallchannel
+BOT_TOKEN  = os.getenv("BOT_TOKEN",  8763607043:AAF5z26R1bmyqKW-twxhe4kss9ueK5PqL9M)
 ADMIN_IDS  = [
-    int(x) for x in os.getenv("ADMIN_IDS", "0").split(",") if x.strip().isdigit()
+    int(x) for x in os.getenv("ADMIN_IDS", "@philaccio42069").split(",") if x.strip().isdigit()
 ]
 SPIKE_THRESHOLD    = float(os.getenv("SPIKE_THRESHOLD", "50"))  # percent
 MONITOR_INTERVAL   = int(os.getenv("MONITOR_INTERVAL",  "300")) # seconds
@@ -126,6 +124,33 @@ def get_chat_id(update: Update) -> int:
     return 0
 
 
+def parse_coin_input(raw: str) -> str:
+    """
+    Sanitise user coin input.
+    - Solana CA (base58 32-44 chars): preserve exact case, strip $ and #
+    - Everything else: uppercase, strip $ and #
+    """
+    clean = raw.strip().replace("$", "").replace("#", "")
+    if is_solana_ca(clean):
+        return clean          # preserve case — base58 is case-sensitive
+    return clean.upper()
+
+
+def token_display(coin: str, token_info=None) -> str:
+    """
+    Human-readable display label for a coin.
+    If it's a CA and we have resolved token info, show SYMBOL (CA…).
+    Otherwise just return the coin string.
+    """
+    if token_info and is_solana_ca(coin):
+        sym = token_info.symbol
+        short_ca = coin[:4] + "…" + coin[-4:]
+        return f"{sym} `({short_ca})`"
+    if is_solana_ca(coin):
+        return f"`{coin[:6]}…{coin[-6:]}`"
+    return coin
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # /start  /help
 # ─────────────────────────────────────────────────────────────────────────────
@@ -136,8 +161,8 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "I document your financial decisions with the love and mockery they deserve.\n\n"
         "━━━━━━━━━━━━━━━━━\n"
         "*📞 Call Commands*\n"
-        "`/call <COIN> <entry> [target] [stop]` — Post a call\n"
-        "`/close <COIN> <exit_price>` — Close your call\n"
+        "`/call <COIN or CA> <entry> [target] [stop]` — Post a call\n"
+        "`/close <COIN or CA> <exit_price>` — Close your call\n"
         "`/calls` — List all open calls\n"
         "`/mycalls` — Your open calls\n\n"
         "*📊 Stats & Leaderboards*\n"
@@ -153,9 +178,10 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "`/networkstats` — Global network stats\n"
         "`/mystats` — Your personal disaster report\n\n"
         "*🖼 Visual Commands*\n"
-        "`/chart <COIN>` — Fetch a 4H chart\n"
-        "`/pnl <COIN>` — Live PnL card for open call\n\n"
+        "`/chart <COIN or CA> [1h/4h/1d]` — Chart via Jupiter + DexScreener\n"
+        "`/pnl <COIN or CA>` — Live PnL card for open call\n\n"
         "━━━━━━━━━━━━━━━━━\n"
+        "_Supports Solana contract addresses and ticker symbols._\n"
         "_Tip: Try typing_ `claude` _somewhere... 🥚_"
     )
     await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
@@ -171,13 +197,14 @@ async def cmd_call(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     if len(args) < 2:
         await update.message.reply_text(
-            "❌ Usage: `/call BTC 65000 [target] [stop]`\n"
-            "Example: `/call ETH 3200 4000 2800`",
+            "❌ Usage: `/call <COIN or CA> <entry> [target] [stop]`\n"
+            "Works with symbols: `/call SOL 150 180 130`\n"
+            "Works with Solana CAs: `/call EPjFWdd5... 0.000012`",
             parse_mode=ParseMode.MARKDOWN
         )
         return
 
-    coin = args[0].upper().replace("$", "").replace("#", "")
+    coin = parse_coin_input(args[0])
     try:
         entry_price = float(args[1].replace(",", ""))
         target     = float(args[2].replace(",", "")) if len(args) > 2 else None
@@ -190,6 +217,27 @@ async def cmd_call(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     register_context(update)
     chat_id  = get_chat_id(update)
     user_row = db.get_user(user.id)
+
+    # Resolve token info (symbol/name for display when CA was given)
+    token_info = None
+    if is_solana_ca(coin):
+        resolving_msg = await update.message.reply_text(
+            f"🔍 Looking up token on Jupiter…"
+        )
+        token_info = await run_in_executor(resolve_token, coin)
+        try:
+            await resolving_msg.delete()
+        except Exception:
+            pass
+        if token_info is None:
+            await update.message.reply_text(
+                f"❌ Couldn't find this token on Jupiter or DexScreener.\n"
+                f"_Double-check the contract address — or the scam already rugged._"
+            )
+            return
+
+    disp = token_display(coin, token_info)
+    coin_label = token_info.symbol if token_info else coin  # for leaderboard/shame display
 
     # ── Duplicate detection ───────────────────────────────────────────────
     existing = db.get_open_call_for_coin(coin, chat_id)
@@ -213,7 +261,7 @@ async def cmd_call(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
         caption = (
             f"🚨 *DUPLICATE CALL DETECTED* 🚨\n\n"
-            f"{user_mention(user_row)} just called #{coin} at {fmt_price(entry_price)}\n"
+            f"{user_mention(user_row)} just called {disp} at {fmt_price(entry_price)}\n"
             f"…but {user_mention(orig_user)} already called it at {fmt_price(existing['entry_price'])}\n\n"
             f"🤡 *Roast Panel:*\n{roast}\n\n"
             f"_Both users are now equally responsible for whatever happens. God help them._\n"
@@ -239,15 +287,25 @@ async def cmd_call(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     call_id = db.insert_call(user.id, coin, entry_price, target, stop_loss, chat_id=chat_id)
     roast   = get_call_roast(user.first_name or "Anon", coin, entry_price, target, stop_loss)
 
-    target_str   = fmt_price(target) if target else "_none set (classic)_"
-    stop_str     = fmt_price(stop_loss) if stop_loss else "_no stop (bold strategy)_"
-    target_pct   = f"  `({((target-entry_price)/entry_price*100):+.1f}%)`" if target else ""
-    stop_pct     = f"  `({((stop_loss-entry_price)/entry_price*100):+.1f}%)`" if stop_loss else ""
+    target_str = fmt_price(target) if target else "_none set (classic)_"
+    stop_str   = fmt_price(stop_loss) if stop_loss else "_no stop (bold strategy)_"
+    target_pct = f"  `({((target-entry_price)/entry_price*100):+.1f}%)`" if target else ""
+    stop_pct   = f"  `({((stop_loss-entry_price)/entry_price*100):+.1f}%)`" if stop_loss else ""
+
+    # Token metadata line (only for Solana CAs)
+    meta_line = ""
+    if token_info and is_solana_ca(coin):
+        chain_str = token_info.chain.upper() if token_info.chain else "SOL"
+        name_str  = f" — {token_info.name}" if token_info.name != token_info.symbol else ""
+        meta_line = f"🔗 *Token:* `{token_info.symbol}`{name_str} | {chain_str}\n"
+        if len(coin) > 10:
+            meta_line += f"📋 *CA:* `{coin}`\n"
 
     caption = (
-        f"📞 *NEW CALL* — #{coin}/USDT\n"
+        f"📞 *NEW CALL* — {disp}\n"
         f"━━━━━━━━━━━━━━━━━\n"
         f"👤 *Caller:* {user_mention(user_row)}\n"
+        f"{meta_line}"
         f"💰 *Entry:* `{fmt_price(entry_price)}`\n"
         f"🎯 *Target:* {target_str}{target_pct}\n"
         f"🛑 *Stop Loss:* {stop_str}{stop_pct}\n"
@@ -288,7 +346,7 @@ async def cmd_close(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    coin = args[0].upper().replace("$", "").replace("#", "")
+    coin = parse_coin_input(args[0])
     try:
         exit_price = float(args[1].replace(",", ""))
     except ValueError:
@@ -300,22 +358,24 @@ async def cmd_close(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if user.id in ADMIN_IDS:
             open_call = db.get_open_call_for_coin(coin)
         if not open_call:
-            await update.message.reply_text(f"❌ No open call found for #{coin}.")
+            disp_err = token_display(coin)
+            await update.message.reply_text(f"❌ No open call found for {disp_err}.")
             return
 
-    entry    = open_call["entry_price"]
-    pnl_pct  = ((exit_price - entry) / entry) * 100
+    entry   = open_call["entry_price"]
+    pnl_pct = ((exit_price - entry) / entry) * 100
     db.close_call(open_call["id"], exit_price, pnl_pct)
 
-    caller   = db.get_user(open_call["user_id"])
-    roast    = get_pnl_roast(caller.get("first_name", "Anon"), coin, pnl_pct)
+    caller  = db.get_user(open_call["user_id"])
+    roast   = get_pnl_roast(caller.get("first_name", "Anon"), coin, pnl_pct)
 
     duration = datetime.utcnow() - datetime.fromisoformat(open_call["created_at"])
     hours    = max(0, int(duration.total_seconds() // 3600))
     emoji    = "🟢" if pnl_pct >= 0 else "🔴"
+    disp     = token_display(coin)
 
     caption = (
-        f"{emoji} *CALL CLOSED* — #{coin}/USDT\n"
+        f"{emoji} *CALL CLOSED* — {disp}\n"
         f"━━━━━━━━━━━━━━━━━\n"
         f"👤 *Trader:* {user_mention(caller)}\n"
         f"📥 *Entry:* `{fmt_price(entry)}`\n"
@@ -643,27 +703,37 @@ async def cmd_mycalls(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_chart(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not ctx.args:
-        await update.message.reply_text("❌ Usage: `/chart BTC`", parse_mode=ParseMode.MARKDOWN)
+        await update.message.reply_text(
+            "❌ Usage: `/chart <COIN or CA> [interval]`\n"
+            "Intervals: `1h` `4h` `1d` (default: `4h`)\n"
+            "Example: `/chart SOL 1h` or `/chart EPjFWdd5…`",
+            parse_mode=ParseMode.MARKDOWN
+        )
         return
 
-    coin = ctx.args[0].upper().replace("$", "").replace("#", "")
+    coin     = parse_coin_input(ctx.args[0])
     interval = ctx.args[1].lower() if len(ctx.args) > 1 else "4h"
-    if interval not in ("1h", "4h", "1d", "15m"):
+    if interval not in ("15m", "1h", "4h", "1d"):
         interval = "4h"
 
-    msg = await update.message.reply_text(f"📊 Fetching {interval} chart for #{coin}…")
+    disp = token_display(coin)
+    msg  = await update.message.reply_text(f"📊 Fetching {interval} chart for {disp}…")
     chart_buf = await run_in_executor(generate_chart, coin, None, None, None, interval)
 
     if chart_buf:
+        try:
+            await msg.delete()
+        except Exception:
+            pass
         await update.message.reply_photo(
             photo=chart_buf,
-            caption=f"📊 *#{coin}/USDT* — {interval} Chart",
+            caption=f"📊 {disp} — {interval.upper()} Chart  •  via Jupiter + DexScreener",
             parse_mode=ParseMode.MARKDOWN
         )
     else:
         await msg.edit_text(
-            f"❌ Couldn't fetch chart for #{coin}.\n"
-            "_Either the coin doesn't exist or it's already been rugged. Check your spelling._"
+            f"❌ Couldn't fetch chart for {disp}.\n"
+            "_Token not found on Jupiter or DexScreener — check the address or it already rugged._"
         )
 
 
@@ -674,29 +744,36 @@ async def cmd_chart(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def cmd_pnl(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     if not ctx.args:
-        await update.message.reply_text("❌ Usage: `/pnl BTC`", parse_mode=ParseMode.MARKDOWN)
+        await update.message.reply_text(
+            "❌ Usage: `/pnl <COIN or CA>`", parse_mode=ParseMode.MARKDOWN
+        )
         return
 
-    coin      = ctx.args[0].upper().replace("$", "").replace("#", "")
+    coin      = parse_coin_input(ctx.args[0])
+    disp      = token_display(coin)
     open_call = db.get_user_open_call(user.id, coin)
 
     if not open_call:
         await update.message.reply_text(
-            f"❌ No open call for #{coin}.\n_Can't generate a PnL card for a trade that doesn't exist. That would be fiction._"
+            f"❌ No open call for {disp}.\n"
+            f"_Can't generate a PnL card for a trade that doesn't exist. That would be fiction._"
         )
         return
 
-    msg = await update.message.reply_text(f"🔄 Fetching live price for #{coin}…")
+    msg     = await update.message.reply_text(f"🔄 Fetching live price for {disp}…")
     current = await run_in_executor(get_current_price, coin)
 
     if not current:
-        await msg.edit_text("❌ Couldn't fetch current price from Binance.")
+        await msg.edit_text(
+            f"❌ Couldn't fetch current price for {disp}.\n"
+            "_Jupiter and DexScreener both came up empty. The scam may have already ended._"
+        )
         return
 
-    entry    = open_call["entry_price"]
-    pnl_pct  = ((current - entry) / entry) * 100
+    entry   = open_call["entry_price"]
+    pnl_pct = ((current - entry) / entry) * 100
     duration = datetime.utcnow() - datetime.fromisoformat(open_call["created_at"])
-    hours    = int(duration.total_seconds() // 3600)
+    hours   = int(duration.total_seconds() // 3600)
 
     pnl_buf = await run_in_executor(
         generate_pnl_card,
@@ -704,7 +781,7 @@ async def cmd_pnl(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     )
 
     caption = (
-        f"📊 *Live PnL — #{coin}*\n"
+        f"📊 *Live PnL — {disp}*\n"
         f"Entry: `{fmt_price(entry)}` → Now: `{fmt_price(current)}`\n"
         f"PnL: `{pnl_pct:+.2f}%` over `{hours}h`"
     )
@@ -729,12 +806,13 @@ async def button_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     # ── Chart button ─────────────────────────────────────────────────────
     if data.startswith("chart_"):
-        coin = data.split("_", 1)[1]
+        coin      = data.split("_", 1)[1]
+        disp      = token_display(coin)
         chart_buf = await run_in_executor(generate_chart, coin)
         if chart_buf:
             await query.message.reply_photo(
                 photo=chart_buf,
-                caption=f"📊 *#{coin}/USDT* — 4H Chart",
+                caption=f"📊 {disp} — 4H Chart  •  via Jupiter + DexScreener",
                 parse_mode=ParseMode.MARKDOWN
             )
         else:
@@ -863,6 +941,7 @@ async def send_spike_alert(
     pnl_pct: float,
     caller_user_id: int,
     call_id: int,
+    chat_id: int = 0,
 ):
     caller    = db.get_user(caller_user_id)
     name      = caller.get("first_name", "Someone")
@@ -884,18 +963,25 @@ async def send_spike_alert(
 
     chart_buf = await run_in_executor(generate_chart, coin, entry_price)
 
+    # Determine destination: send to the group the call was made in.
+    # If chat_id is 0 (call made in a DM / unknown), skip silently.
+    if not chat_id:
+        logger.warning(f"Spike alert for call #{call_id} has no chat_id — skipping send.")
+        return
+
     try:
         if chart_buf:
             await app.bot.send_photo(
-                chat_id=CHANNEL_ID, photo=chart_buf,
+                chat_id=chat_id, photo=chart_buf,
                 caption=caption, parse_mode=ParseMode.MARKDOWN
             )
         else:
             await app.bot.send_message(
-                chat_id=CHANNEL_ID, text=caption, parse_mode=ParseMode.MARKDOWN
+                chat_id=chat_id, text=caption, parse_mode=ParseMode.MARKDOWN
             )
+        logger.info(f"Spike alert sent to chat {chat_id} for #{coin} ({pnl_pct:+.1f}%)")
     except Exception as e:
-        logger.error(f"Failed to send spike alert to channel: {e}")
+        logger.error(f"Failed to send spike alert to chat {chat_id}: {e}")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -948,8 +1034,8 @@ def main():
         name="price_monitor"
     )
 
-    logger.info(f"🤡 Call Channel Roast Bot starting — Channel: {CHANNEL_ID}")
-    logger.info(f"⚡ Spike threshold: {SPIKE_THRESHOLD}% | Monitor interval: {MONITOR_INTERVAL}s")
+    logger.info(f"🤡 Call Channel Roast Bot starting — multi-group mode")
+    logger.info(f"⚡ Spike threshold: {SPIKE_THRESHOLD:.0f}% | Monitor interval: {MONITOR_INTERVAL}s | Spike alerts go to originating group")
     app.run_polling(drop_pending_updates=True)
 
 
