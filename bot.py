@@ -165,6 +165,7 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "`/close <COIN or CA> <exit_price>` — Close your call\n"
         "`/calls` — List all open calls\n"
         "`/mycalls` — Your open calls\n\n"
+        "💡 *Just paste a CA* — I'll auto-detect and log it as a call\n\n"
         "*📊 Stats & Leaderboards*\n"
         "`/leaderboard` — Group leaderboard (or global in DMs)\n"
         "`/gleaderboard` — 🌍 Global leaderboard\n"
@@ -412,27 +413,19 @@ async def cmd_close(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def _send_leaderboard(update: Update, ctx: ContextTypes.DEFAULT_TYPE,
                              mode: str, scope: str, sort: str, period: str,
                              edit_message=None):
-    """
-    Core renderer used by both the command and the inline button callbacks.
-    mode:   "top" | "shame"
-    scope:  "group" | "global"
-    sort:   "avg_pnl" | "win_rate" | "total_calls" | "best_call" | "total_pnl" | "consistency"
-    period: "all" | "month" | "week" | "today"
-    """
     register_context(update)
     chat_id    = get_chat_id(update)
     has_group  = chat_id != 0
     group_info = db.get_group(chat_id) if has_group else None
     group_title = (group_info["title"] if group_info else None) or "This Group"
 
-    # Fetch rows
     if scope == "group" and has_group:
         if mode == "shame":
             rows = db.get_shame_group(chat_id, sort=sort, period=period)
         else:
             rows = db.get_leaderboard_group(chat_id, sort=sort, period=period)
     else:
-        scope = "global"  # Normalise: can't do group scope in a DM
+        scope = "global"
         if mode == "shame":
             rows = db.get_shame_global(sort=sort, period=period)
         else:
@@ -455,7 +448,6 @@ async def _send_leaderboard(update: Update, ctx: ContextTypes.DEFAULT_TYPE,
 
 
 async def cmd_leaderboard(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Auto-scopes to group if in a group, global if in DM."""
     chat_id = get_chat_id(update)
     scope   = "group" if chat_id else "global"
     await _send_leaderboard(update, ctx, mode="top", scope=scope,
@@ -463,13 +455,11 @@ async def cmd_leaderboard(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_gleaderboard(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Explicit global leaderboard."""
     await _send_leaderboard(update, ctx, mode="top", scope="global",
                              sort="avg_pnl", period="all")
 
 
 async def cmd_shame(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Wall of Shame — auto-scoped."""
     chat_id = get_chat_id(update)
     scope   = "group" if chat_id else "global"
     await _send_leaderboard(update, ctx, mode="shame", scope=scope,
@@ -477,7 +467,6 @@ async def cmd_shame(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_gshame(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Explicit global Wall of Shame."""
     await _send_leaderboard(update, ctx, mode="shame", scope="global",
                              sort="avg_pnl", period="all")
 
@@ -643,7 +632,7 @@ async def cmd_streak(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# /networkstats  — Global network overview (public-friendly)
+# /networkstats
 # ─────────────────────────────────────────────────────────────────────────────
 
 async def cmd_networkstats(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -919,14 +908,159 @@ async def button_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# EASTER EGG — message handler
+# MESSAGE HANDLER — CA scanner + easter egg
+#
+# Scans every non-command message for a Solana contract address.
+# Rules:
+#   1. Message must be ONLY the CA — nothing else (trimmed).
+#      This prevents the bot firing on normal chat that happens to contain an address.
+#   2. Easter egg check runs first so it short-circuits.
+#   3. 30-second per-(chat, ca) cooldown prevents duplicate fires from
+#      rapid reposts or edited messages.
+#   4. Jupiter lookup → if token not found, silent skip (no noise).
+#   5. Duplicate detection runs identically to /call.
 # ─────────────────────────────────────────────────────────────────────────────
+
+import time as _time
+import re as _re
+
+# In-memory cooldown: {(chat_id_or_user_id, ca): timestamp}
+_CA_COOLDOWN: dict = {}
+_CA_COOLDOWN_SECS = 30
+
 
 async def message_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not update.message or not update.message.text:
         return
-    if EASTER_EGG_TRIGGER in update.message.text.lower():
+
+    text = update.message.text.strip()
+
+    # ── Easter egg ────────────────────────────────────────────────────────
+    if EASTER_EGG_TRIGGER in text.lower():
         await update.message.reply_text(EASTER_EGG_RESPONSE, parse_mode=ParseMode.MARKDOWN)
+        return
+
+    # ── CA detection: message must be exactly one CA, nothing else ────────
+    # Strip leading $ or # that some people add before a CA
+    candidate = text.lstrip("$#").strip()
+
+    if not is_solana_ca(candidate):
+        return   # not a CA — ignore, no response
+
+    ca = candidate  # case is preserved — base58 is case-sensitive
+
+    # ── Cooldown ──────────────────────────────────────────────────────────
+    user    = update.effective_user
+    chat_id = get_chat_id(update)
+    cooldown_key = (chat_id or user.id, ca)
+    now = _time.time()
+    if now - _CA_COOLDOWN.get(cooldown_key, 0) < _CA_COOLDOWN_SECS:
+        return  # fired recently — skip silently
+    _CA_COOLDOWN[cooldown_key] = now
+
+    # ── Register context ──────────────────────────────────────────────────
+    register_context(update)
+    user_row = db.get_user(user.id)
+
+    # ── Jupiter lookup ────────────────────────────────────────────────────
+    thinking = await update.message.reply_text("🔍 Looking up on Jupiter…")
+
+    token_info = await run_in_executor(resolve_token, ca)
+
+    if token_info is None or token_info.current_price is None:
+        await thinking.edit_text(
+            f"❌ `{ca[:6]}…{ca[-6:]}` — not found on Jupiter or DexScreener.\n"
+            f"_Either this token isn't listed yet, or it already rugged._",
+            parse_mode=ParseMode.MARKDOWN
+        )
+        return
+
+    try:
+        await thinking.delete()
+    except Exception:
+        pass
+
+    entry_price = token_info.current_price
+    disp        = token_display(ca, token_info)
+    sym         = token_info.symbol
+
+    # ── Duplicate detection ───────────────────────────────────────────────
+    existing = db.get_open_call_for_coin(ca, chat_id)
+
+    if existing and existing["user_id"] != user.id:
+        orig_user = db.get_user(existing["user_id"])
+        db.increment_duplicates(user.id, chat_id)
+        db.increment_got_copied(existing["user_id"], chat_id)
+
+        call_id = db.insert_call(
+            user.id, ca, entry_price, None, None,
+            is_duplicate=1, duplicate_of=existing["id"], chat_id=chat_id
+        )
+        roast = get_duplicate_roast(
+            caller_name=user.first_name or "This person",
+            original_name=orig_user.get("first_name", "the original caller"),
+            coin=sym,
+            original_price=existing["entry_price"],
+            new_price=entry_price,
+        )
+        caption = (
+            f"🚨 *DUPLICATE CALL* 🚨\n\n"
+            f"{user_mention(user_row)} just dropped {disp} at {fmt_price(entry_price)}\n"
+            f"…but {user_mention(orig_user)} already had this at {fmt_price(existing['entry_price'])}\n\n"
+            f"🤡 {roast}\n\n"
+            f"_Call ID: #{call_id}_"
+        )
+        keyboard = InlineKeyboardMarkup([[
+            InlineKeyboardButton("📊 Chart",        callback_data=f"chart_{ca}"),
+            InlineKeyboardButton("🔥 Roast Again",  callback_data=f"xroast_{call_id}"),
+        ]])
+        chart_buf = await run_in_executor(generate_chart, ca, entry_price)
+        if chart_buf:
+            await update.message.reply_photo(
+                photo=chart_buf, caption=caption,
+                parse_mode=ParseMode.MARKDOWN, reply_markup=keyboard
+            )
+        else:
+            await update.message.reply_text(
+                caption, parse_mode=ParseMode.MARKDOWN, reply_markup=keyboard
+            )
+        return
+
+    # ── Fresh auto-call ───────────────────────────────────────────────────
+    call_id = db.insert_call(user.id, ca, entry_price, None, None, chat_id=chat_id)
+    roast   = get_call_roast(user.first_name or "Anon", ca, entry_price, None, None)
+
+    chain_str = (token_info.chain or "solana").upper()
+    name_str  = f" — {token_info.name}" if token_info.name and token_info.name != sym else ""
+
+    caption = (
+        f"📞 *CALL LOGGED* — {disp}\n"
+        f"━━━━━━━━━━━━━━━━━\n"
+        f"👤 *Caller:* {user_mention(user_row)}\n"
+        f"🔗 *Token:* `{sym}`{name_str} | {chain_str}\n"
+        f"📋 *CA:* `{ca}`\n"
+        f"💰 *Entry:* `{fmt_price(entry_price)}` _(Jupiter live price)_\n"
+        f"🕐 *Time:* `{datetime.utcnow().strftime('%Y-%m-%d %H:%M')} UTC`\n"
+        f"━━━━━━━━━━━━━━━━━\n"
+        f"🤡 {roast}\n\n"
+        f"_Close with `/close {ca} <price>`_\n"
+        f"_Call ID: #{call_id}_"
+    )
+    keyboard = InlineKeyboardMarkup([[
+        InlineKeyboardButton("📊 Chart",        callback_data=f"chart_{ca}"),
+        InlineKeyboardButton("🔥 Roast Harder", callback_data=f"xroast_{call_id}"),
+        InlineKeyboardButton("📈 Live PnL",     callback_data=f"livepnl_{call_id}"),
+    ]])
+    chart_buf = await run_in_executor(generate_chart, ca, entry_price)
+    if chart_buf:
+        await update.message.reply_photo(
+            photo=chart_buf, caption=caption,
+            parse_mode=ParseMode.MARKDOWN, reply_markup=keyboard
+        )
+    else:
+        await update.message.reply_text(
+            caption, parse_mode=ParseMode.MARKDOWN, reply_markup=keyboard
+        )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -963,8 +1097,6 @@ async def send_spike_alert(
 
     chart_buf = await run_in_executor(generate_chart, coin, entry_price)
 
-    # Determine destination: send to the group the call was made in.
-    # If chat_id is 0 (call made in a DM / unknown), skip silently.
     if not chat_id:
         logger.warning(f"Spike alert for call #{call_id} has no chat_id — skipping send.")
         return
@@ -1022,7 +1154,7 @@ def main():
     # Inline button handler
     app.add_handler(CallbackQueryHandler(button_handler))
 
-    # Easter egg message handler (non-command messages)
+    # Message handler — CA scanner + easter egg
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, message_handler))
 
     # Price monitor job
